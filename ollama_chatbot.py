@@ -6,9 +6,34 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QTextEdit, QLineEdit, QPushButton, 
                             QComboBox, QLabel, QMessageBox, QProgressBar, 
                             QSlider, QDialog, QListWidget, QFileDialog,
-                            QStatusBar, QShortcut)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QPalette, QColor, QKeySequence
+                            QStatusBar, QShortcut, QSpinBox, QMenu)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt5.QtGui import QFont, QPalette, QColor, QKeySequence, QTextCharFormat, QSyntaxHighlighter
+import requests
+import markdown
+from pygments import highlight
+from pygments.lexers import get_lexer_by_name
+from pygments.formatters import HtmlFormatter
+
+# Model presets for different conversation styles
+MODEL_PRESETS = {
+    "Balanced": {"temperature": 0.7, "top_p": 0.9, "top_k": 40},
+    "Creative": {"temperature": 0.9, "top_p": 0.95, "top_k": 100},
+    "Precise": {"temperature": 0.3, "top_p": 0.85, "top_k": 20},
+    "Custom": {"temperature": 0.7, "top_p": 0.9, "top_k": 40}
+}
+
+class MarkdownHighlighter(QSyntaxHighlighter):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.code_format = QTextCharFormat()
+        self.code_format.setBackground(QColor("#2d2d2d"))
+        self.code_format.setForeground(QColor("#d4d4d4"))
+        self.code_format.setFontFamily("Consolas")
+
+    def highlightBlock(self, text):
+        if text.startswith("```") or text.startswith("    "):
+            self.setFormat(0, len(text), self.code_format)
 
 class ChatWorker(QThread):
     response_received = pyqtSignal(str)
@@ -111,11 +136,12 @@ class ChatWindow(QMainWindow):
         self.chat_log_dir = "chat_logs"
         self.current_model = "llama3"
         self.system_prompt = "You are a helpful AI assistant."
-        self.temperature = 0.7
-        self.top_p = 0.9
-        self.top_k = 40
-        self.max_tokens = 4096  # Default max tokens
+        self.preset_name = "Balanced"
+        self.load_preset(self.preset_name)
+        self.max_tokens = 4096
         self.estimated_tokens = 0
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 3
         os.makedirs(self.chat_log_dir, exist_ok=True)
         
         self.init_ui()
@@ -128,23 +154,12 @@ class ChatWindow(QMainWindow):
         self.status_timer.timeout.connect(self.clear_status)
         self.status_timer.setSingleShot(True)
 
-    def setup_shortcuts(self):
-        # Send message shortcut (Ctrl+Enter)
-        self.send_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
-        self.send_shortcut.activated.connect(self.send_message)
+    def load_preset(self, preset_name):
+        preset = MODEL_PRESETS[preset_name]
+        self.temperature = preset["temperature"]
+        self.top_p = preset["top_p"]
+        self.top_k = preset["top_k"]
         
-        # Clear chat shortcut (Ctrl+L)
-        self.clear_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
-        self.clear_shortcut.activated.connect(self.clear_chat)
-        
-        # Save chat shortcut (Ctrl+S)
-        self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
-        self.save_shortcut.activated.connect(self.save_chat)
-        
-        # Load chat shortcut (Ctrl+O)
-        self.load_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
-        self.load_shortcut.activated.connect(self.load_chat)
-
     def init_ui(self):
         self.setWindowTitle('Ollama Chat')
         self.setMinimumSize(800, 600)
@@ -220,7 +235,14 @@ class ChatWindow(QMainWindow):
         self.model_combo = QComboBox()
         self.model_combo.addItem(self.current_model)
         
-        temp_label = QLabel("Temp:")
+        preset_layout = QHBoxLayout()
+        preset_label = QLabel("Preset:")
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(MODEL_PRESETS.keys())
+        self.preset_combo.setCurrentText(self.preset_name)
+        self.preset_combo.currentTextChanged.connect(self.on_preset_changed)
+        
+        temp_label = QLabel("Temperature:")
         self.temp_slider = QSlider(Qt.Horizontal)
         self.temp_slider.setRange(0, 100)
         self.temp_slider.setValue(int(self.temperature * 100))
@@ -229,11 +251,14 @@ class ChatWindow(QMainWindow):
         
         model_layout.addWidget(model_label)
         model_layout.addWidget(self.model_combo)
-        model_layout.addWidget(temp_label)
-        model_layout.addWidget(self.temp_slider)
-        model_layout.addWidget(self.temp_value)
-        model_layout.addStretch()
+        preset_layout.addWidget(preset_label)
+        preset_layout.addWidget(self.preset_combo)
+        preset_layout.addWidget(temp_label)
+        preset_layout.addWidget(self.temp_slider)
+        preset_layout.addWidget(self.temp_value)
+        preset_layout.addStretch()
         layout.addLayout(model_layout)
+        layout.addLayout(preset_layout)
 
         # System prompt
         system_layout = QHBoxLayout()
@@ -243,11 +268,22 @@ class ChatWindow(QMainWindow):
         system_layout.addWidget(self.system_input)
         layout.addLayout(system_layout)
 
-        # Chat display
+        # Context visualization
+        context_layout = QHBoxLayout()
+        self.context_label = QLabel("Context: 0 messages")
+        self.context_clear = QPushButton("Clear Context")
+        self.context_clear.clicked.connect(self.clear_context)
+        context_layout.addWidget(self.context_label)
+        context_layout.addWidget(self.context_clear)
+        context_layout.addStretch()
+        layout.addLayout(context_layout)
+
+        # Chat display with markdown support
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
         self.chat_display.setFont(QFont("Segoe UI", 10))
         self.chat_display.setMinimumHeight(400)
+        self.markdown_highlighter = MarkdownHighlighter(self.chat_display.document())
         layout.addWidget(self.chat_display)
 
         # Progress bar
@@ -305,6 +341,40 @@ class ChatWindow(QMainWindow):
         self.setStatusBar(self.statusBar)
         self.statusBar.showMessage("Ready")
 
+    def setup_shortcuts(self):
+        # Send message shortcut (Ctrl+Enter)
+        self.send_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.send_shortcut.activated.connect(self.send_message)
+        
+        # Clear chat shortcut (Ctrl+L)
+        self.clear_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        self.clear_shortcut.activated.connect(self.clear_chat)
+        
+        # Save chat shortcut (Ctrl+S)
+        self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.save_shortcut.activated.connect(self.save_chat)
+        
+        # Load chat shortcut (Ctrl+O)
+        self.load_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
+        self.load_shortcut.activated.connect(self.load_chat)
+
+    def on_preset_changed(self, preset_name):
+        self.preset_name = preset_name
+        self.load_preset(preset_name)
+        if preset_name != "Custom":
+            self.temp_slider.setValue(int(self.temperature * 100))
+            self.update_context_info()
+            
+    def clear_context(self):
+        self.chat_history = []
+        self.update_context_info()
+        self.set_status("Context cleared")
+        
+    def update_context_info(self):
+        msg_count = len(self.chat_history)
+        tokens = sum(len(msg["content"].split()) for msg in self.chat_history)
+        self.context_label.setText(f"Context: {msg_count} messages ({tokens} est. tokens)")
+        
     def estimate_tokens(self, text):
         # Simple estimation: ~4 characters per token
         self.estimated_tokens = len(text) // 4
@@ -353,10 +423,16 @@ class ChatWindow(QMainWindow):
             response = requests.get(f"{self.base_url}/tags", timeout=5)
             if response.status_code != 200:
                 raise Exception("Ollama server is not responding correctly")
+            self.reconnect_attempts = 0
         except Exception as e:
-            QMessageBox.critical(self, "Error", 
-                               "Could not connect to Ollama server. Please make sure it's running.")
-            sys.exit(1)
+            self.reconnect_attempts += 1
+            if self.reconnect_attempts < self.max_reconnect_attempts:
+                self.set_status(f"Reconnecting to Ollama (attempt {self.reconnect_attempts})...")
+                QTimer.singleShot(2000, self.check_ollama_status)
+            else:
+                QMessageBox.critical(self, "Error", 
+                                   "Could not connect to Ollama server. Please make sure it's running.")
+                sys.exit(1)
 
     def load_available_models(self):
         try:
@@ -435,7 +511,13 @@ class ChatWindow(QMainWindow):
         elif not chunk.startswith(" "):
             cursor.insertText(" ")
             
-        cursor.insertText(chunk.strip())
+        # Convert markdown to HTML for code blocks
+        if "```" in chunk:
+            html_chunk = markdown.markdown(chunk, extensions=['fenced_code', 'codehilite'])
+            cursor.insertHtml(html_chunk)
+        else:
+            cursor.insertText(chunk.strip())
+            
         self.chat_display.setTextCursor(cursor)
         self.chat_display.ensureCursorVisible()
 
@@ -532,5 +614,4 @@ def main():
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
-    import requests
     main()
