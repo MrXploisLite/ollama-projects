@@ -6,9 +6,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QTextEdit, QLineEdit, QPushButton, 
                             QComboBox, QLabel, QMessageBox, QProgressBar, 
                             QSlider, QDialog, QListWidget, QFileDialog,
-                            QStatusBar, QShortcut, QSpinBox, QMenu)
+                            QStatusBar, QShortcut, QSpinBox, QMenu, QInputDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt5.QtGui import QFont, QPalette, QColor, QKeySequence, QTextCharFormat, QSyntaxHighlighter
+from PyQt5.QtGui import QFont, QPalette, QColor, QKeySequence, QTextCharFormat, QSyntaxHighlighter, QClipboard
 import requests
 import markdown
 from pygments import highlight
@@ -22,6 +22,30 @@ MODEL_PRESETS = {
     "Precise": {"temperature": 0.3, "top_p": 0.85, "top_k": 20},
     "Custom": {"temperature": 0.7, "top_p": 0.9, "top_k": 40}
 }
+
+class MessageStyle:
+    USER_COLOR = "#4CAF50"  # Green
+    AI_COLOR = "#2196F3"    # Blue
+    CODE_BG = "#1E1E1E"     # Dark background for code
+    ERROR_COLOR = "#F44336" # Red for errors
+    
+    @staticmethod
+    def format_message(role, content):
+        color = MessageStyle.USER_COLOR if role == "user" else MessageStyle.AI_COLOR
+        return (f'<div style="margin: 10px 0; padding: 10px; border-radius: 5px; '
+                f'background-color: rgba({",".join(str(int(color[i:i+2], 16)) for i in (1,3,5))}, 0.1);">'
+                f'<span style="color: {color}; font-weight: bold;">{role.title()}: </span>{content}</div>')
+    
+    @staticmethod
+    def format_code(code, language=""):
+        return (f'<pre style="background-color: {MessageStyle.CODE_BG}; padding: 10px; '
+                f'border-radius: 5px; margin: 10px 0;"><code>{code}</code>'
+                f'<button class="copy-btn">Copy</button></pre>')
+    
+    @staticmethod
+    def format_error(message):
+        return (f'<div style="color: {MessageStyle.ERROR_COLOR}; margin: 10px 0; padding: 10px; '
+                f'border-left: 3px solid {MessageStyle.ERROR_COLOR};">{message}</div>')
 
 class MarkdownHighlighter(QSyntaxHighlighter):
     def __init__(self, parent=None):
@@ -142,6 +166,9 @@ class ChatWindow(QMainWindow):
         self.estimated_tokens = 0
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 3
+        self.dark_mode = True
+        self.conversation_branches = []
+        self.current_branch = []
         os.makedirs(self.chat_log_dir, exist_ok=True)
         
         self.init_ui()
@@ -278,6 +305,32 @@ class ChatWindow(QMainWindow):
         context_layout.addStretch()
         layout.addLayout(context_layout)
 
+        # Search bar
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search in chat...")
+        self.search_input.returnPressed.connect(self.search_chat)
+        self.search_prev = QPushButton("↑")
+        self.search_next = QPushButton("↓")
+        self.search_prev.clicked.connect(lambda: self.search_chat(direction=-1))
+        self.search_next.clicked.connect(lambda: self.search_chat(direction=1))
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_prev)
+        search_layout.addWidget(self.search_next)
+        layout.addLayout(search_layout)
+
+        # Branch controls
+        branch_layout = QHBoxLayout()
+        self.branch_label = QLabel("Current Branch: Main")
+        self.new_branch_btn = QPushButton("New Branch")
+        self.new_branch_btn.clicked.connect(self.create_new_branch)
+        self.switch_branch_btn = QPushButton("Switch Branch")
+        self.switch_branch_btn.clicked.connect(self.switch_branch)
+        branch_layout.addWidget(self.branch_label)
+        branch_layout.addWidget(self.new_branch_btn)
+        branch_layout.addWidget(self.switch_branch_btn)
+        layout.addLayout(branch_layout)
+
         # Chat display with markdown support
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
@@ -325,10 +378,14 @@ class ChatWindow(QMainWindow):
         self.load_button.clicked.connect(self.load_chat)
         self.export_button = QPushButton("Export Chat")
         self.export_button.clicked.connect(self.export_chat)
+        self.theme_button = QPushButton("")
+        self.theme_button.setToolTip("Toggle Dark/Light Theme")
+        self.theme_button.clicked.connect(self.toggle_theme)
         button_layout.addWidget(self.clear_button)
         button_layout.addWidget(self.save_button)
         button_layout.addWidget(self.load_button)
         button_layout.addWidget(self.export_button)
+        button_layout.addWidget(self.theme_button)
         button_layout.addStretch()
         layout.addLayout(button_layout)
 
@@ -457,11 +514,14 @@ class ChatWindow(QMainWindow):
 
         # Check token limit
         if self.estimate_tokens(message) > self.max_tokens:
-            self.set_status("Message exceeds token limit")
+            error_msg = MessageStyle.format_error("Message exceeds token limit")
+            self.chat_display.append(error_msg)
+            self.set_status("Message too long")
             return
 
-        # Display user message
-        self.chat_display.append(f"\nYou: {message}")
+        # Display user message with styling
+        formatted_message = MessageStyle.format_message("user", message)
+        self.chat_display.append(formatted_message)
         self.message_input.clear()
         self.message_input.setEnabled(False)
         self.send_button.setEnabled(False)
@@ -502,19 +562,17 @@ class ChatWindow(QMainWindow):
         
         # Initialize AI response if needed
         if cursor.position() == 0 or not self.chat_display.toPlainText().rstrip().endswith("AI:"):
-            self.chat_display.append("\nAI:")
+            formatted_message = MessageStyle.format_message("assistant", "")
+            cursor.insertHtml(formatted_message)
             cursor.movePosition(cursor.End)
         
-        # Add a space if we're not at the start of the response
-        if self.chat_display.toPlainText().rstrip().endswith("AI:"):
-            cursor.insertText(" ")
-        elif not chunk.startswith(" "):
-            cursor.insertText(" ")
-            
-        # Convert markdown to HTML for code blocks
+        # Handle code blocks
         if "```" in chunk:
-            html_chunk = markdown.markdown(chunk, extensions=['fenced_code', 'codehilite'])
-            cursor.insertHtml(html_chunk)
+            code_block = chunk.split("```")[1]
+            language = code_block.split("\n")[0].strip()
+            code = "\n".join(code_block.split("\n")[1:])
+            formatted_code = MessageStyle.format_code(code, language)
+            cursor.insertHtml(formatted_code)
         else:
             cursor.insertText(chunk.strip())
             
@@ -606,6 +664,159 @@ class ChatWindow(QMainWindow):
         
         load_button.clicked.connect(load_selected)
         dialog.exec_()
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.theme_button.setText("" if self.dark_mode else "")
+        
+        # Update color scheme
+        if self.dark_mode:
+            self.setStyleSheet("""
+                QMainWindow, QWidget { background-color: #1e1e1e; color: #ffffff; }
+                QTextEdit, QLineEdit, QComboBox {
+                    background-color: #2d2d2d;
+                    border: 1px solid #3d3d3d;
+                    border-radius: 4px;
+                    padding: 8px;
+                    color: #ffffff;
+                }
+                QPushButton {
+                    background-color: #0078d4;
+                    color: white;
+                    border: none;
+                }
+                QPushButton:hover { background-color: #106ebe; }
+                QPushButton:pressed { background-color: #005a9e; }
+            """)
+        else:
+            self.setStyleSheet("""
+                QMainWindow, QWidget { background-color: #ffffff; color: #000000; }
+                QTextEdit, QLineEdit, QComboBox {
+                    background-color: #f5f5f5;
+                    border: 1px solid #dddddd;
+                    border-radius: 4px;
+                    padding: 8px;
+                    color: #000000;
+                }
+                QPushButton {
+                    background-color: #0078d4;
+                    color: white;
+                    border: none;
+                }
+                QPushButton:hover { background-color: #106ebe; }
+                QPushButton:pressed { background-color: #005a9e; }
+            """)
+
+    def copy_code_to_clipboard(self, code):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(code)
+        self.set_status("Code copied to clipboard")
+
+    def handle_copy_button_click(self, button):
+        # Find the code block associated with this button
+        code_block = button.parent()
+        if code_block and isinstance(code_block, QTextEdit):
+            code = code_block.toPlainText()
+            self.copy_code_to_clipboard(code)
+
+    def search_chat(self, direction=1):
+        query = self.search_input.text().lower()
+        if not query:
+            return
+            
+        cursor = self.chat_display.textCursor()
+        current_pos = cursor.position()
+        
+        # Get all text
+        text = self.chat_display.toPlainText().lower()
+        
+        if direction > 0:
+            # Search forward
+            next_pos = text.find(query, current_pos)
+            if next_pos == -1:  # Wrap around
+                next_pos = text.find(query)
+        else:
+            # Search backward
+            next_pos = text.rfind(query, 0, current_pos)
+            if next_pos == -1:  # Wrap around
+                next_pos = text.rfind(query)
+                
+        if next_pos != -1:
+            cursor.setPosition(next_pos)
+            cursor.movePosition(cursor.Right, cursor.KeepAnchor, len(query))
+            self.chat_display.setTextCursor(cursor)
+            self.chat_display.ensureCursorVisible()
+        else:
+            self.set_status("Text not found")
+
+    def create_new_branch(self):
+        name, ok = QInputDialog.getText(self, "New Branch", "Enter branch name:")
+        if ok and name:
+            # Save current conversation state
+            branch = {
+                "name": name,
+                "history": self.chat_history.copy(),
+                "system_prompt": self.system_input.text(),
+                "model": self.model_combo.currentText(),
+                "temperature": self.temperature
+            }
+            self.conversation_branches.append(branch)
+            self.current_branch = branch
+            self.branch_label.setText(f"Current Branch: {name}")
+            self.set_status(f"Created new branch: {name}")
+
+    def switch_branch(self):
+        if not self.conversation_branches:
+            self.set_status("No branches available")
+            return
+            
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Switch Branch")
+        layout = QVBoxLayout(dialog)
+        
+        branch_list = QListWidget()
+        branch_list.addItem("Main")
+        for branch in self.conversation_branches:
+            branch_list.addItem(branch["name"])
+            
+        layout.addWidget(branch_list)
+        
+        def switch():
+            selected = branch_list.currentItem()
+            if selected:
+                branch_name = selected.text()
+                if branch_name == "Main":
+                    self.current_branch = None
+                    self.chat_history = []
+                else:
+                    for branch in self.conversation_branches:
+                        if branch["name"] == branch_name:
+                            self.current_branch = branch
+                            self.chat_history = branch["history"].copy()
+                            self.system_input.setText(branch["system_prompt"])
+                            self.model_combo.setCurrentText(branch["model"])
+                            self.temperature = branch["temperature"]
+                            self.temp_slider.setValue(int(self.temperature * 100))
+                            break
+                            
+                self.branch_label.setText(f"Current Branch: {branch_name}")
+                self.update_chat_display()
+                dialog.accept()
+        
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(switch)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.exec_()
+
+    def update_chat_display(self):
+        self.chat_display.clear()
+        for msg in self.chat_history:
+            formatted_msg = MessageStyle.format_message(msg["role"], msg["content"])
+            self.chat_display.append(formatted_msg)
 
 def main():
     app = QApplication(sys.argv)
