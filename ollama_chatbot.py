@@ -187,46 +187,47 @@ class ChatWorker(QThread):
         super().__init__()
         self.model = model
         self.message = message
-        self.history = history
+        self.history = history + [{"role": "user", "content": message}]  # Add current message to history
         self.base_url = base_url
         self.full_response = ""
         
     def run(self):
         try:
-            payload = {
+            url = f"{self.base_url}/chat"
+            headers = {"Content-Type": "application/json"}
+            data = {
                 "model": self.model,
-                "messages": self.history + [{"role": "user", "content": self.message}],
-                "stream": True,
-                "options": {
-                    "temperature": 0.7,
-                    "top_p": 0.9,
-                    "num_predict": 4096
-                }
+                "messages": self.history,
+                "stream": True
             }
             
-            response = requests.post(
-                f"{self.base_url}/chat",
-                json=payload,
-                stream=True,
-                timeout=60
-            )
+            response = requests.post(url, headers=headers, json=data, stream=True)
+            response.raise_for_status()
             
             for line in response.iter_lines():
                 if line:
                     try:
-                        json_response = json.loads(line)
-                        if 'message' in json_response and 'content' in json_response['message']:
-                            content = json_response['message']['content']
-                            self.full_response += content
-                            self.chunk_received.emit(content)
-                    except json.JSONDecodeError:
-                        continue
+                        chunk_data = json.loads(line)
+                        if "error" in chunk_data:
+                            self.error_occurred.emit(chunk_data["error"])
+                            return
                         
+                        if "message" in chunk_data:
+                            chunk = chunk_data["message"].get("content", "")
+                            if chunk:
+                                self.chunk_received.emit(chunk)
+                                self.full_response += chunk
+                    except json.JSONDecodeError as e:
+                        self.error_occurred.emit(f"Error decoding response: {str(e)}")
+                        return
+            
             if self.full_response:
                 self.response_received.emit(self.full_response)
                 
+        except requests.exceptions.RequestException as e:
+            self.error_occurred.emit(f"Network error: {str(e)}")
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            self.error_occurred.emit(f"Error: {str(e)}")
 
 class ChatWindow(QMainWindow):
     def __init__(self):
