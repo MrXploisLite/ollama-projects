@@ -72,95 +72,64 @@ class ServerStatus:
     ERROR = "Error"
 
 class MessageStyle:
-    USER_COLOR = "#4CAF50"  # Green
-    AI_COLOR = "#2196F3"    # Blue
-    CODE_BG = "#1E1E1E"     # Dark background for code
-    ERROR_COLOR = "#F44336" # Red for errors
+    USER_COLOR = "#2ecc71"  # Green
+    AI_COLOR = "#3498db"    # Blue
+    CODE_BG = "#2d2d2d"     # Dark gray
+    ERROR_COLOR = "#e74c3c" # Red
     
     @staticmethod
-    def format_message(role, content):
-        """Format a message with role-based styling and markdown/code processing."""
-        # Process the content for markdown and code blocks
-        formatted_content = content
-        
-        # Handle code blocks first
-        if "```" in formatted_content:
-            parts = formatted_content.split("```")
-            formatted_parts = []
-            for i, part in enumerate(parts):
-                if i % 2 == 0:  # Not a code block
-                    formatted_parts.append(MessageStyle.process_markdown(part))
-                else:  # Code block
-                    try:
-                        language = part.split('\n')[0].strip()
-                        code = '\n'.join(part.split('\n')[1:])
-                        formatted_parts.append(MessageStyle.format_code(code, language))
-                    except IndexError:
-                        formatted_parts.append(MessageStyle.format_code(part, ""))
-            formatted_content = "".join(formatted_parts)
-        else:
-            formatted_content = MessageStyle.process_markdown(formatted_content)
-        
-        # Apply role-based styling
-        color = MessageStyle.USER_COLOR if role.lower() == "user" else MessageStyle.AI_COLOR
-        return (f'<div style="margin: 10px 0; padding: 10px; border-radius: 5px; '
-                f'background-color: rgba({",".join(str(int(color[i:i+2], 16)) for i in (1,3,5))}, 0.1);">'
-                f'<span style="color: {color}; font-weight: bold;">{role.title()}: </span>'
-                f'{formatted_content}</div>')
-    
-    @staticmethod
-    def process_markdown(text):
-        """Process markdown text to HTML, excluding code blocks."""
+    def format_code_block(code, language='python'):
+        """Format code blocks with syntax highlighting."""
         try:
-            # Convert markdown to HTML
-            html = markdown.markdown(text, extensions=['fenced_code', 'tables'])
-            
-            # Add custom styling
-            html = html.replace('<p>', '<p style="margin: 5px 0;">')
-            html = html.replace('<ul>', '<ul style="margin: 5px 0; padding-left: 20px;">')
-            html = html.replace('<ol>', '<ol style="margin: 5px 0; padding-left: 20px;">')
-            html = html.replace('<li>', '<li style="margin: 2px 0;">')
-            
-            return html
-        except Exception:
-            return text
-    
-    @staticmethod
-    def format_code(code, language=""):
-        """Format code with syntax highlighting and copy button."""
-        try:
-            if language and language != "":
-                lexer = get_lexer_by_name(language, stripall=True)
-            else:
-                from pygments.lexers import guess_lexer
-                try:
-                    lexer = guess_lexer(code)
-                except:
-                    lexer = get_lexer_by_name("text")
-            
+            lexer = get_lexer_by_name(language)
             formatter = HtmlFormatter(style='monokai', 
-                                   cssclass='highlight',
                                    noclasses=True,
-                                   nowrap=True)
+                                   nobackground=True)
             highlighted = highlight(code, lexer, formatter)
+            return f'<div style="background-color: {MessageStyle.CODE_BG}; padding: 10px; border-radius: 5px; margin: 5px 0;">{highlighted}</div>'
         except Exception:
-            # Fallback to simple formatting if highlighting fails
-            highlighted = f'<pre style="color: #f8f8f2;">{code}</pre>'
-        
-        return (f'<div style="background-color: {MessageStyle.CODE_BG}; padding: 10px; '
-                f'border-radius: 5px; margin: 10px 0; position: relative;">'
-                f'{highlighted}'
-                f'<button onclick="copyCode(this)" style="position: absolute; top: 5px; right: 5px; '
-                f'padding: 5px 10px; background: #333; color: white; border: none; '
-                f'border-radius: 3px; cursor: pointer;">Copy</button></div>')
-    
+            return f'<pre style="background-color: {MessageStyle.CODE_BG}; padding: 10px; border-radius: 5px; margin: 5px 0;"><code>{code}</code></pre>'
+
     @staticmethod
-    def format_error(message):
-        """Format error messages with distinctive styling."""
-        return (f'<div style="color: {MessageStyle.ERROR_COLOR}; margin: 10px 0; padding: 10px; '
-                f'background-color: rgba({",".join(str(int(MessageStyle.ERROR_COLOR[i:i+2], 16)) for i in (1,3,5))}, 0.1); '
-                f'border-left: 3px solid {MessageStyle.ERROR_COLOR}; border-radius: 3px;">'
-                f'<span style="font-weight: bold;">Error: </span>{message}</div>')
+    def format_message(text, is_user=True):
+        """Format chat messages with proper styling and code highlighting."""
+        color = MessageStyle.USER_COLOR if is_user else MessageStyle.AI_COLOR
+        
+        # Convert markdown to HTML
+        html = markdown.markdown(text, extensions=['fenced_code', 'codehilite'])
+        
+        # Find and replace code blocks with syntax highlighted versions
+        import re
+        code_block_pattern = r'<pre><code.*?>(.*?)</code></pre>'
+        
+        def replace_code_block(match):
+            code = match.group(1)
+            # Unescape HTML entities
+            code = code.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+            return MessageStyle.format_code_block(code)
+        
+        html = re.sub(code_block_pattern, replace_code_block, html, flags=re.DOTALL)
+        
+        # Add message styling
+        styled_html = f'''
+        <div style="color: {color}; margin-bottom: 10px;">
+            <div style="padding: 5px; border-radius: 5px;">
+                {html}
+            </div>
+        </div>
+        '''
+        return styled_html
+
+    @staticmethod
+    def format_error(error_text):
+        """Format error messages."""
+        return f'''
+        <div style="color: {MessageStyle.ERROR_COLOR}; margin: 5px 0;">
+            <div style="padding: 5px; border-radius: 5px;">
+                Error: {error_text}
+            </div>
+        </div>
+        '''
 
 class MarkdownHighlighter(QSyntaxHighlighter):
     def __init__(self, parent=None):
@@ -998,35 +967,20 @@ class ChatWindow(QMainWindow):
         self.set_status(f"Error: {error_message}")
 
     def update_chat_display(self):
-        """Update the chat display with all messages."""
-        display_html = []
+        """Update the chat display with formatted messages."""
+        self.chat_display.clear()
+        formatted_chat = ""
         
-        for msg in self.chat_history:
-            formatted_msg = MessageStyle.format_message(msg["role"], msg["content"])
-            display_html.append(formatted_msg)
+        for message in self.chat_history:
+            is_user = message.get('role') == 'user'
+            content = message.get('content', '')
+            formatted_chat += MessageStyle.format_message(content, is_user)
         
-        # Add copy-to-clipboard JavaScript
-        js_code = """
-        <script>
-        function copyCode(button) {
-            var pre = button.parentElement.querySelector('pre');
-            var code = pre.innerText;
-            navigator.clipboard.writeText(code).then(function() {
-                button.textContent = 'Copied!';
-                setTimeout(function() { button.textContent = 'Copy'; }, 2000);
-            }).catch(function(err) {
-                console.error('Failed to copy:', err);
-                button.textContent = 'Error';
-            });
-        }
-        </script>
-        """
+        self.chat_display.setHtml(formatted_chat)
         
-        full_html = js_code + "\n".join(display_html)
-        self.chat_display.setHtml(full_html)
-        self.chat_display.verticalScrollBar().setValue(
-            self.chat_display.verticalScrollBar().maximum()
-        )
+        # Scroll to bottom
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def update_server_status(self, status):
         """Update server status and UI indicators."""
