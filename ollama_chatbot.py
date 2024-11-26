@@ -6,9 +6,12 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QTextEdit, QLineEdit, QPushButton, 
                             QComboBox, QLabel, QMessageBox, QProgressBar, 
                             QSlider, QDialog, QListWidget, QFileDialog,
-                            QStatusBar, QShortcut, QSpinBox, QMenu, QInputDialog)
+                            QStatusBar, QShortcut, QSpinBox, QMenu, QInputDialog,
+                            QDoubleSpinBox, QGroupBox, QFormLayout, QListWidgetItem,
+                            QActionGroup, QColorDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt5.QtGui import QFont, QPalette, QColor, QKeySequence, QTextCharFormat, QSyntaxHighlighter, QClipboard
+from PyQt5.QtGui import (QFont, QPalette, QColor, QKeySequence, QTextCharFormat, 
+                      QSyntaxHighlighter, QClipboard)
 import requests
 import markdown
 from pygments import highlight
@@ -20,10 +23,46 @@ import threading
 
 # Model presets for different conversation styles
 MODEL_PRESETS = {
-    "Balanced": {"temperature": 0.7, "top_p": 0.9, "top_k": 40},
-    "Creative": {"temperature": 0.9, "top_p": 0.95, "top_k": 100},
-    "Precise": {"temperature": 0.3, "top_p": 0.85, "top_k": 20},
-    "Custom": {"temperature": 0.7, "top_p": 0.9, "top_k": 40}
+    "Balanced": {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 40,
+        "repeat_penalty": 1.1,
+        "presence_penalty": 0,
+        "frequency_penalty": 0
+    },
+    "Creative": {
+        "temperature": 0.9,
+        "top_p": 0.95,
+        "top_k": 100,
+        "repeat_penalty": 1.05,
+        "presence_penalty": 0.2,
+        "frequency_penalty": 0.2
+    },
+    "Precise": {
+        "temperature": 0.3,
+        "top_p": 0.85,
+        "top_k": 20,
+        "repeat_penalty": 1.2,
+        "presence_penalty": -0.1,
+        "frequency_penalty": -0.1
+    },
+    "Custom": {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 40,
+        "repeat_penalty": 1.1,
+        "presence_penalty": 0,
+        "frequency_penalty": 0
+    }
+}
+
+CHAT_PERSONAS = {
+    "Default": "You are a helpful AI assistant.",
+    "Professional": "You are a professional AI assistant focused on providing clear, accurate, and well-structured responses.",
+    "Teacher": "You are a patient and knowledgeable teacher who explains concepts clearly and provides examples.",
+    "Programmer": "You are a skilled programmer who provides detailed technical explanations and code examples.",
+    "Custom": "You are a helpful AI assistant."
 }
 
 class ServerStatus:
@@ -141,11 +180,13 @@ class GitAutoSync:
         self.interval = interval
         self.running = False
         self.thread = None
+        self.last_sync_time = None
 
     def start(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._sync_loop, daemon=True)
-        self.thread.start()
+        if not self.running:
+            self.running = True
+            self.thread = threading.Thread(target=self._sync_loop, daemon=True)
+            self.thread.start()
 
     def stop(self):
         self.running = False
@@ -156,27 +197,61 @@ class GitAutoSync:
         while self.running:
             try:
                 self._perform_sync()
+                self.last_sync_time = datetime.now()
             except Exception as e:
                 print(f"Auto-sync error: {str(e)}")
             time.sleep(self.interval)
 
     def _perform_sync(self):
         try:
-            # Add all changes
-            subprocess.run(["git", "add", "."], cwd=self.repo_path, check=True)
-            
-            # Create commit with timestamp
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            subprocess.run(
-                ["git", "commit", "-m", f"Auto-sync: {timestamp}"],
-                cwd=self.repo_path, check=True
+            # Check if there are any changes
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
             )
-            
-            # Push changes
-            subprocess.run(["git", "push", "origin", "main"], cwd=self.repo_path, check=True)
-        except subprocess.CalledProcessError:
-            # If nothing to commit, just skip
-            pass
+
+            if status.stdout.strip():
+                # Add all changes
+                subprocess.run(
+                    ["git", "add", "."],
+                    cwd=self.repo_path,
+                    check=True
+                )
+                
+                # Create commit with timestamp
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                subprocess.run(
+                    ["git", "commit", "-m", f"Auto-sync: {timestamp}"],
+                    cwd=self.repo_path,
+                    check=True
+                )
+                
+                # Push changes
+                subprocess.run(
+                    ["git", "push", "origin", "main"],
+                    cwd=self.repo_path,
+                    check=True
+                )
+                print(f"Auto-sync completed at {timestamp}")
+                return True
+        except subprocess.CalledProcessError as e:
+            print(f"Git operation failed: {str(e)}")
+        except Exception as e:
+            print(f"Auto-sync error: {str(e)}")
+        return False
+
+    def get_status(self):
+        if not self.running:
+            return "Git Auto-sync: Disabled"
+        if not self.last_sync_time:
+            return "Git Auto-sync: Waiting for first sync..."
+        
+        time_diff = datetime.now() - self.last_sync_time
+        minutes = int(time_diff.total_seconds() / 60)
+        return f"Last auto-sync: {minutes} minutes ago"
 
 class ModelManager:
     def __init__(self):
@@ -401,11 +476,20 @@ class ChatWindow(QMainWindow):
         self.chat_history = []
         self.chat_log_dir = "chat_logs"
         self.current_model = "llama2"
-        self.system_prompt = "You are a helpful AI assistant."
+        self.system_prompt = "You are a helpful AI assistant. The user's name is Romy Rianata."
         self.preset_name = "Balanced"
         self.server_status = ServerStatus.DISCONNECTED
         self.model_manager = ModelManager()
         self.worker = None
+        self.user_name = "Romy Rianata"
+        self.dark_mode = True
+        self.model_preset = "Balanced"
+        
+        # Initialize Git auto-sync
+        self.git_sync = GitAutoSync(os.path.dirname(os.path.abspath(__file__)))
+        
+        # Load settings
+        self.load_settings()
         
         # Load preset and create directories
         self.load_preset(self.preset_name)
@@ -420,15 +504,94 @@ class ChatWindow(QMainWindow):
         self.check_ollama_status()
         self.load_available_models()
         
+        # Start Git auto-sync
+        self.git_sync.start()
+        
         # Set window properties
-        self.setWindowTitle("Ollama Chat")
+        self.setWindowTitle(f"Ollama Chat - {self.user_name}")
         self.setMinimumSize(800, 600)
+        
+        # Send welcome message
+        self.display_welcome_message()
+
+    def load_settings(self):
+        try:
+            if os.path.exists('settings.json'):
+                with open('settings.json', 'r') as f:
+                    settings = json.load(f)
+                    self.user_name = settings.get('user_name', self.user_name)
+                    self.dark_mode = settings.get('dark_mode', self.dark_mode)
+                    self.system_prompt = settings.get('system_prompt', self.system_prompt)
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+
+    def save_settings(self):
+        try:
+            settings = {
+                'user_name': self.user_name,
+                'dark_mode': self.dark_mode,
+                'system_prompt': self.system_prompt,
+                'model_preset': self.model_preset
+            }
+            with open('settings.json', 'w') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+
+    def display_welcome_message(self):
+        welcome_msg = f"Welcome back, {self.user_name}! I'm your AI assistant powered by {self.current_model}. How can I help you today?"
+        self.chat_history.append({"role": "assistant", "content": welcome_msg})
+        self.update_chat_display()
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.apply_theme()
+        self.save_settings()
+
+    def apply_theme(self, bg_color=None, text_color=None):
+        if self.dark_mode:
+            if bg_color is None:
+                bg_color = "#1e1e1e"
+            if text_color is None:
+                text_color = "#d4d4d4"
+        else:
+            if bg_color is None:
+                bg_color = "#ffffff"
+            if text_color is None:
+                text_color = "#000000"
+        
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background-color: {bg_color};
+                color: {text_color};
+            }}
+            QTextEdit, QLineEdit {{
+                background-color: #2d2d2d;
+                color: #d4d4d4;
+                border: 1px solid #3d3d3d;
+                border-radius: 3px;
+            }}
+            QComboBox, QPushButton {{
+                background-color: #2d2d2d;
+                color: #d4d4d4;
+                border: 1px solid #3d3d3d;
+                border-radius: 3px;
+                padding: 5px;
+            }}
+            QComboBox:hover, QPushButton:hover {{
+                background-color: #3d3d3d;
+            }}
+            QLabel {{
+                color: #d4d4d4;
+            }}
+        """)
 
     def closeEvent(self, event):
         """Clean up resources before closing."""
         if self.worker:
             self.worker.stop()
             self.worker.wait()
+        self.git_sync.stop()  # Stop Git auto-sync
         event.accept()
 
     def setup_timers(self):
@@ -448,11 +611,95 @@ class ChatWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         
+        # Add menu bar
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu('File')
+        
+        new_chat_action = file_menu.addAction('New Chat')
+        new_chat_action.setShortcut('Ctrl+N')
+        new_chat_action.triggered.connect(self.clear_chat)
+        
+        save_chat_action = file_menu.addAction('Save Chat')
+        save_chat_action.setShortcut('Ctrl+S')
+        save_chat_action.triggered.connect(self.save_chat)
+        
+        load_chat_action = file_menu.addAction('Load Chat')
+        load_chat_action.setShortcut('Ctrl+O')
+        load_chat_action.triggered.connect(self.load_chat)
+        
+        export_chat_action = file_menu.addAction('Export Chat')
+        export_chat_action.setShortcut('Ctrl+E')
+        export_chat_action.triggered.connect(self.export_chat)
+        
+        file_menu.addSeparator()
+        
+        exit_action = file_menu.addAction('Exit')
+        exit_action.setShortcut('Ctrl+Q')
+        exit_action.triggered.connect(self.close)
+        
+        # Settings menu
+        settings_menu = menubar.addMenu('Settings')
+        
+        # Theme submenu
+        theme_menu = settings_menu.addMenu('Theme')
+        
+        theme_action = theme_menu.addAction('Toggle Dark/Light')
+        theme_action.triggered.connect(self.toggle_theme)
+        
+        customize_colors_action = theme_menu.addAction('Customize Colors')
+        customize_colors_action.triggered.connect(self.customize_colors)
+        
+        # Model settings submenu
+        model_menu = settings_menu.addMenu('Model Settings')
+        
+        select_model_action = model_menu.addAction('Select Model')
+        select_model_action.triggered.connect(self.select_model)
+        
+        edit_params_action = model_menu.addAction('Edit Parameters')
+        edit_params_action.triggered.connect(self.edit_model_params)
+        
+        # Persona submenu
+        persona_menu = settings_menu.addMenu('Chat Persona')
+        self.persona_group = QActionGroup(self)
+        
+        for persona in CHAT_PERSONAS:
+            action = persona_menu.addAction(persona)
+            action.setCheckable(True)
+            action.setChecked(persona == "Default")
+            self.persona_group.addAction(action)
+            action.triggered.connect(lambda checked, p=persona: self.change_persona(p))
+        
+        # User settings
+        edit_name_action = settings_menu.addAction('Edit User Name')
+        edit_name_action.triggered.connect(self.edit_user_name)
+        
+        edit_prompt_action = settings_menu.addAction('Edit System Prompt')
+        edit_prompt_action.triggered.connect(self.edit_system_prompt)
+        
+        # Git sync settings
+        git_menu = settings_menu.addMenu('Git Auto-sync')
+        
+        toggle_git_action = git_menu.addAction('Enable/Disable Auto-sync')
+        toggle_git_action.triggered.connect(self.toggle_git_sync)
+        
+        set_interval_action = git_menu.addAction('Set Sync Interval')
+        set_interval_action.triggered.connect(self.set_git_sync_interval)
+        
+        # Help menu
+        help_menu = menubar.addMenu('Help')
+        
+        about_action = help_menu.addAction('About')
+        about_action.triggered.connect(self.show_about)
+        
+        shortcuts_action = help_menu.addAction('Keyboard Shortcuts')
+        shortcuts_action.triggered.connect(self.show_shortcuts)
+        
         # Add chat display
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
         self.chat_display.setAcceptRichText(True)
-        self.chat_display.setStyleSheet("QTextEdit { background-color: #1e1e1e; color: #d4d4d4; }")
         layout.addWidget(self.chat_display)
         
         # Add input area
@@ -519,7 +766,13 @@ class ChatWindow(QMainWindow):
         layout.addLayout(controls_layout)
         
         # Add status bar
-        self.statusBar().showMessage("Ready")
+        self.statusBar().addPermanentWidget(QLabel())  # Git sync status
+        self.update_git_status()  # Initial status update
+        
+        # Status update timer
+        self.git_status_timer = QTimer(self)
+        self.git_status_timer.timeout.connect(self.update_git_status)
+        self.git_status_timer.start(60000)  # Update every minute
         
         # Add progress bar
         self.progress_bar = QProgressBar()
@@ -842,7 +1095,7 @@ class ChatWindow(QMainWindow):
         dialog.setLayout(layout)
         dialog.resize(400, 300)
         dialog.exec_()
-        
+
     def save_chat(self):
         """Save current chat history to a file."""
         if not self.chat_history:
@@ -864,6 +1117,299 @@ class ChatWindow(QMainWindow):
             self.set_status(f"Chat saved to {filename}")
         except Exception as e:
             self.set_status(f"Error saving chat: {str(e)}")
+
+    def edit_user_name(self):
+        name, ok = QInputDialog.getText(self, 'Edit User Name', 'Enter your name:', text=self.user_name)
+        if ok and name:
+            self.user_name = name
+            self.setWindowTitle(f"Ollama Chat - {self.user_name}")
+            self.system_prompt = f"You are a helpful AI assistant. The user's name is {self.user_name}."
+            self.save_settings()
+
+    def edit_system_prompt(self):
+        prompt, ok = QInputDialog.getText(self, 'Edit System Prompt', 'Enter system prompt:', 
+                                        text=self.system_prompt)
+        if ok:
+            self.system_prompt = prompt
+            self.save_settings()
+
+    def toggle_git_sync(self):
+        if self.git_sync.running:
+            self.git_sync.stop()
+            self.set_status("Git auto-sync disabled")
+        else:
+            self.git_sync.start()
+            self.set_status("Git auto-sync enabled")
+        self.update_git_status()
+
+    def set_git_sync_interval(self):
+        current_interval = self.git_sync.interval // 60  # Convert to minutes
+        interval, ok = QInputDialog.getInt(
+            self, 'Set Sync Interval',
+            'Enter sync interval in minutes:',
+            value=current_interval,
+            min=1, max=60
+        )
+        if ok:
+            self.git_sync.interval = interval * 60  # Convert to seconds
+            self.set_status(f"Git sync interval set to {interval} minutes")
+
+    def update_git_status(self):
+        status = self.git_sync.get_status()
+        self.statusBar().findChild(QLabel).setText(status)
+
+    def customize_colors(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Customize Colors")
+        layout = QVBoxLayout(dialog)
+        
+        # Color pickers for different elements
+        colors = {
+            "Background": "#1e1e1e" if self.dark_mode else "#ffffff",
+            "Text": "#d4d4d4" if self.dark_mode else "#000000",
+            "User Message": MessageStyle.USER_COLOR,
+            "AI Message": MessageStyle.AI_COLOR,
+            "Code Background": MessageStyle.CODE_BG,
+            "Error": MessageStyle.ERROR_COLOR
+        }
+        
+        color_pickers = {}
+        for name, default_color in colors.items():
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{name}:"))
+            button = QPushButton()
+            button.setStyleSheet(f"background-color: {default_color};")
+            button.clicked.connect(lambda checked, n=name: self.pick_color(n, button, color_pickers))
+            row.addWidget(button)
+            layout.addLayout(row)
+            color_pickers[name] = button
+        
+        buttons = QHBoxLayout()
+        save = QPushButton("Save")
+        save.clicked.connect(lambda: self.save_colors(color_pickers, dialog))
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dialog.reject)
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        
+        dialog.exec_()
+
+    def pick_color(self, name, button, color_pickers):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            button.setStyleSheet(f"background-color: {color.name()};")
+            color_pickers[name].color = color.name()
+
+    def save_colors(self, color_pickers, dialog):
+        try:
+            colors = {name: button.color for name, button in color_pickers.items()}
+            MessageStyle.USER_COLOR = colors.get("User Message", MessageStyle.USER_COLOR)
+            MessageStyle.AI_COLOR = colors.get("AI Message", MessageStyle.AI_COLOR)
+            MessageStyle.CODE_BG = colors.get("Code Background", MessageStyle.CODE_BG)
+            MessageStyle.ERROR_COLOR = colors.get("Error", MessageStyle.ERROR_COLOR)
+            
+            self.apply_theme(
+                bg_color=colors.get("Background"),
+                text_color=colors.get("Text")
+            )
+            
+            self.save_settings()
+            self.update_chat_display()
+            dialog.accept()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to save colors: {str(e)}")
+
+    def change_persona(self, persona):
+        self.system_prompt = CHAT_PERSONAS[persona]
+        self.save_settings()
+        self.set_status(f"Changed persona to: {persona}")
+
+    def show_about(self):
+        about_text = f"""
+        <h2>Ollama Chat</h2>
+        <p>Version 1.0.0</p>
+        <p>Created by: {self.user_name}</p>
+        <p>A modern chat interface for Ollama AI models.</p>
+        <p>Current Model: {self.current_model}</p>
+        <p> 2024 All rights reserved.</p>
+        """
+        QMessageBox.about(self, "About Ollama Chat", about_text)
+
+    def show_shortcuts(self):
+        shortcuts_text = """
+        <h3>Keyboard Shortcuts</h3>
+        <table>
+        <tr><td><b>Ctrl+N:</b></td><td>New Chat</td></tr>
+        <tr><td><b>Ctrl+S:</b></td><td>Save Chat</td></tr>
+        <tr><td><b>Ctrl+O:</b></td><td>Load Chat</td></tr>
+        <tr><td><b>Ctrl+E:</b></td><td>Export Chat</td></tr>
+        <tr><td><b>Ctrl+Q:</b></td><td>Exit</td></tr>
+        <tr><td><b>Ctrl+Enter:</b></td><td>Send Message</td></tr>
+        </table>
+        """
+        QMessageBox.information(self, "Keyboard Shortcuts", shortcuts_text)
+
+    def select_model(self):
+        models = self.get_available_models()
+        if not models:
+            QMessageBox.warning(self, "Error", "Failed to fetch available models. Please ensure Ollama is running.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Model")
+        layout = QVBoxLayout(dialog)
+
+        # Model selection
+        model_group = QGroupBox("Available Models")
+        model_layout = QVBoxLayout()
+        
+        model_list = QListWidget()
+        for model in models:
+            item = QListWidgetItem(model)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if model == self.current_model else Qt.Unchecked)
+            model_list.addItem(item)
+        
+        model_layout.addWidget(model_list)
+        model_group.setLayout(model_layout)
+        layout.addWidget(model_group)
+
+        # Preset selection
+        preset_group = QGroupBox("Model Preset")
+        preset_layout = QVBoxLayout()
+        
+        preset_combo = QComboBox()
+        preset_combo.addItems(MODEL_PRESETS.keys())
+        preset_combo.setCurrentText("Balanced")  # Default preset
+        preset_layout.addWidget(preset_combo)
+        
+        # Parameter display
+        param_layout = QFormLayout()
+        param_widgets = {}
+        
+        for param, value in MODEL_PRESETS["Balanced"].items():
+            param_label = QLabel(param.replace("_", " ").title() + ":")
+            param_spin = QDoubleSpinBox()
+            param_spin.setRange(0.0, 2.0)
+            param_spin.setSingleStep(0.1)
+            param_spin.setValue(value)
+            param_widgets[param] = param_spin
+            param_layout.addRow(param_label, param_spin)
+        
+        preset_layout.addLayout(param_layout)
+        preset_group.setLayout(preset_layout)
+        layout.addWidget(preset_group)
+
+        # Update parameters when preset changes
+        def update_params():
+            preset = preset_combo.currentText()
+            preset_values = MODEL_PRESETS[preset]
+            for param, value in preset_values.items():
+                param_widgets[param].setValue(value)
+        
+        preset_combo.currentTextChanged.connect(update_params)
+
+        # Buttons
+        buttons = QHBoxLayout()
+        save = QPushButton("Save")
+        cancel = QPushButton("Cancel")
+        
+        def save_model_settings():
+            # Get selected model
+            for i in range(model_list.count()):
+                item = model_list.item(i)
+                if item.checkState() == Qt.Checked:
+                    self.current_model = item.text()
+                    break
+            
+            # Save parameters
+            preset = preset_combo.currentText()
+            if preset == "Custom":
+                # Save custom parameters
+                custom_params = {}
+                for param, widget in param_widgets.items():
+                    custom_params[param] = widget.value()
+                MODEL_PRESETS["Custom"] = custom_params
+            
+            self.model_preset = preset
+            self.save_settings()
+            self.set_status(f"Model changed to: {self.current_model} ({preset} preset)")
+            dialog.accept()
+        
+        save.clicked.connect(save_model_settings)
+        cancel.clicked.connect(dialog.reject)
+        
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        
+        dialog.exec_()
+
+    def edit_model_params(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Model Parameters")
+        layout = QVBoxLayout(dialog)
+        
+        # Parameter inputs
+        param_layout = QFormLayout()
+        param_widgets = {}
+        
+        current_preset = MODEL_PRESETS[self.model_preset]
+        for param, value in current_preset.items():
+            param_label = QLabel(param.replace("_", " ").title() + ":")
+            param_spin = QDoubleSpinBox()
+            param_spin.setRange(0.0, 2.0)
+            param_spin.setSingleStep(0.1)
+            param_spin.setValue(value)
+            param_widgets[param] = param_spin
+            param_layout.addRow(param_label, param_spin)
+        
+        layout.addLayout(param_layout)
+        
+        # Buttons
+        buttons = QHBoxLayout()
+        save = QPushButton("Save as Custom")
+        reset = QPushButton("Reset to Default")
+        cancel = QPushButton("Cancel")
+        
+        def save_custom_params():
+            custom_params = {}
+            for param, widget in param_widgets.items():
+                custom_params[param] = widget.value()
+            MODEL_PRESETS["Custom"] = custom_params
+            self.model_preset = "Custom"
+            self.save_settings()
+            self.set_status("Saved custom model parameters")
+            dialog.accept()
+        
+        def reset_params():
+            self.model_preset = "Balanced"
+            self.save_settings()
+            self.set_status("Reset to default model parameters")
+            dialog.accept()
+        
+        save.clicked.connect(save_custom_params)
+        reset.clicked.connect(reset_params)
+        cancel.clicked.connect(dialog.reject)
+        
+        buttons.addWidget(save)
+        buttons.addWidget(reset)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        
+        dialog.exec_()
+
+    def get_available_models(self):
+        """Fetch available models from Ollama."""
+        try:
+            response = requests.get(f"{self.base_url}/api/tags")
+            if response.status_code == 200:
+                models = [model['name'] for model in response.json()['models']]
+                return sorted(models)
+        except Exception as e:
+            self.set_status(f"Error fetching models: {str(e)}")
+        return []
 
 def main():
     app = QApplication(sys.argv)
