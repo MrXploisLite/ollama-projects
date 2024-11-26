@@ -178,20 +178,174 @@ class GitAutoSync:
             # If nothing to commit, just skip
             pass
 
+class ModelManager:
+    def __init__(self):
+        self.base_url = "http://localhost:11434/api"
+        self.available_models = []
+        self.downloading = False
+        
+    def get_available_models(self):
+        try:
+            response = requests.get(f"{self.base_url}/tags")
+            if response.status_code == 200:
+                models = response.json()['models']
+                self.available_models = [model['name'] for model in models]
+                return self.available_models
+            return []
+        except:
+            return []
+    
+    def download_model(self, model_name, progress_callback=None):
+        if self.downloading:
+            return False
+            
+        self.downloading = True
+        try:
+            response = requests.post(
+                f"{self.base_url}/pull",
+                json={"name": model_name},
+                stream=True
+            )
+            
+            if response.status_code != 200:
+                raise Exception(f"Failed to download model: {response.text}")
+                
+            total_size = 0
+            downloaded_size = 0
+            
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                    
+                data = json.loads(line)
+                if "total" in data:
+                    total_size = data["total"]
+                if "completed" in data:
+                    downloaded_size = data["completed"]
+                    
+                if total_size > 0 and progress_callback:
+                    progress = int((downloaded_size / total_size) * 100)
+                    progress_callback(progress)
+                    
+            self.downloading = False
+            return True
+            
+        except Exception as e:
+            self.downloading = False
+            raise Exception(f"Error downloading model: {str(e)}")
+            
+    def download_model_original(self, model_name, progress_callback=None):
+        if self.downloading:
+            return False
+            
+        self.downloading = True
+        try:
+            url = f"{self.base_url}/pull"
+            headers = {"Content-Type": "application/json"}
+            data = {"name": model_name}
+            
+            with requests.post(url, headers=headers, json=data, stream=True) as response:
+                if response.status_code != 200:
+                    return False
+                    
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            json_response = json.loads(line)
+                            if 'error' in json_response:
+                                return False
+                            
+                            if progress_callback and 'completed' in json_response:
+                                progress = int(json_response['completed'])
+                                progress_callback(progress)
+                                
+                        except json.JSONDecodeError:
+                            continue
+                            
+            return True
+        except:
+            return False
+        finally:
+            self.downloading = False
+
 class ChatWorker(QThread):
     response_received = pyqtSignal(str)
     chunk_received = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    progress_updated = pyqtSignal(int)
     
-    def __init__(self, model, message, history, base_url):
+    def __init__(self, model, message, history, base_url, system_prompt=None):
         super().__init__()
         self.model = model
         self.message = message
-        self.history = history + [{"role": "user", "content": message}]  # Add current message to history
+        self.history = history.copy()
+        if system_prompt:
+            self.history.insert(0, {"role": "system", "content": system_prompt})
+        self.history.append({"role": "user", "content": message})
         self.base_url = base_url
         self.full_response = ""
+        self._is_running = True
+        
+    def stop(self):
+        self._is_running = False
         
     def run(self):
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat",
+                json={
+                    "model": self.model,
+                    "messages": self.history,
+                    "stream": True
+                },
+                stream=True
+            )
+            
+            if response.status_code != 200:
+                error_msg = f"Error: Server returned status code {response.status_code}"
+                try:
+                    error_data = response.json()
+                    if "error" in error_data:
+                        error_msg = f"Error: {error_data['error']}"
+                except:
+                    pass
+                self.error_occurred.emit(error_msg)
+                return
+                
+            for line in response.iter_lines():
+                if not self._is_running:
+                    break
+                    
+                if not line:
+                    continue
+                    
+                try:
+                    data = json.loads(line)
+                    if "error" in data:
+                        self.error_occurred.emit(f"Error: {data['error']}")
+                        return
+                        
+                    if "message" in data:
+                        content = data["message"].get("content", "")
+                        if content:
+                            self.chunk_received.emit(content)
+                            self.full_response += content
+                except json.JSONDecodeError:
+                    self.error_occurred.emit("Error: Invalid response from server")
+                    return
+                except Exception as e:
+                    self.error_occurred.emit(f"Error: {str(e)}")
+                    return
+                    
+            if self._is_running:
+                self.response_received.emit(self.full_response)
+                
+        except requests.exceptions.ConnectionError:
+            self.error_occurred.emit("Error: Could not connect to Ollama server")
+        except Exception as e:
+            self.error_occurred.emit(f"Error: {str(e)}")
+            
+    def run_original(self):
         try:
             url = f"{self.base_url}/chat"
             headers = {"Content-Type": "application/json"}
@@ -201,33 +355,44 @@ class ChatWorker(QThread):
                 "stream": True
             }
             
-            response = requests.post(url, headers=headers, json=data, stream=True)
-            response.raise_for_status()
-            
-            for line in response.iter_lines():
-                if line:
+            with requests.post(url, headers=headers, json=data, stream=True) as response:
+                if response.status_code != 200:
+                    self.error_occurred.emit(f"Server error: {response.status_code}")
+                    return
+                    
+                for line in response.iter_lines():
+                    if not self._is_running:
+                        break
+                        
+                    if not line:
+                        continue
+                        
                     try:
                         chunk_data = json.loads(line)
-                        if "error" in chunk_data:
-                            self.error_occurred.emit(chunk_data["error"])
+                        if 'error' in chunk_data:
+                            self.error_occurred.emit(chunk_data['error'])
                             return
-                        
-                        if "message" in chunk_data:
-                            chunk = chunk_data["message"].get("content", "")
-                            if chunk:
-                                self.chunk_received.emit(chunk)
-                                self.full_response += chunk
-                    except json.JSONDecodeError as e:
-                        self.error_occurred.emit(f"Error decoding response: {str(e)}")
+                            
+                        if 'response' in chunk_data:
+                            chunk = chunk_data['response']
+                            self.full_response += chunk
+                            self.chunk_received.emit(chunk)
+                            
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception as e:
+                        self.error_occurred.emit(f"Error processing response: {str(e)}")
                         return
-            
-            if self.full_response:
-                self.response_received.emit(self.full_response)
-                
+                        
+                if self._is_running and self.full_response:
+                    self.response_received.emit(self.full_response)
+                    
         except requests.exceptions.RequestException as e:
-            self.error_occurred.emit(f"Network error: {str(e)}")
+            if self._is_running:
+                self.error_occurred.emit(f"Connection error: {str(e)}")
         except Exception as e:
-            self.error_occurred.emit(f"Error: {str(e)}")
+            if self._is_running:
+                self.error_occurred.emit(f"Unexpected error: {str(e)}")
 
 class ChatWindow(QMainWindow):
     def __init__(self):
@@ -239,168 +404,134 @@ class ChatWindow(QMainWindow):
         self.system_prompt = "You are a helpful AI assistant."
         self.preset_name = "Balanced"
         self.server_status = ServerStatus.DISCONNECTED
+        self.model_manager = ModelManager()
+        self.worker = None
+        
+        # Load preset and create directories
         self.load_preset(self.preset_name)
-        
-        # Setup server check timer
-        self.server_check_timer = QTimer(self)
-        self.server_check_timer.timeout.connect(self.check_ollama_status)
-        self.server_check_timer.start(30000)  # Check every 30 seconds
-        
-        # Initialize Git auto-sync
-        self.git_sync = GitAutoSync(os.path.dirname(os.path.abspath(__file__)))
-        self.git_sync.start()
-        
-        # Create chat logs directory
         os.makedirs(self.chat_log_dir, exist_ok=True)
         
-        # Setup status update timer
-        self.status_timer = QTimer(self)
-        self.status_timer.timeout.connect(self.clear_status)
-        self.status_timer.setSingleShot(True)
+        # Setup timers
+        self.setup_timers()
         
+        # Initialize UI
         self.init_ui()
         self.setup_shortcuts()
         self.check_ollama_status()
         self.load_available_models()
+        
+        # Set window properties
+        self.setWindowTitle("Ollama Chat")
+        self.setMinimumSize(800, 600)
 
+    def closeEvent(self, event):
+        """Clean up resources before closing."""
+        if self.worker:
+            self.worker.stop()
+            self.worker.wait()
+        event.accept()
+
+    def setup_timers(self):
+        # Server check timer
+        self.server_check_timer = QTimer(self)
+        self.server_check_timer.timeout.connect(self.check_ollama_status)
+        self.server_check_timer.start(30000)  # Check every 30 seconds
+        
+        # Status update timer
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.clear_status)
+        self.status_timer.setSingleShot(True)
+        
+    def init_ui(self):
+        # Create central widget and layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        
+        # Add chat display
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setAcceptRichText(True)
+        self.chat_display.setStyleSheet("QTextEdit { background-color: #1e1e1e; color: #d4d4d4; }")
+        layout.addWidget(self.chat_display)
+        
+        # Add input area
+        input_layout = QHBoxLayout()
+        
+        self.message_input = QTextEdit()
+        self.message_input.setPlaceholderText("Type your message here...")
+        self.message_input.setMaximumHeight(100)
+        self.message_input.setStyleSheet("QTextEdit { background-color: #2d2d2d; color: #d4d4d4; }")
+        self.message_input.textChanged.connect(lambda: self.estimate_tokens(self.message_input.toPlainText()))
+        input_layout.addWidget(self.message_input)
+        
+        # Add token counter
+        token_layout = QHBoxLayout()
+        self.token_label = QLabel("Estimated Tokens: 0 / 4096")
+        self.token_label.setStyleSheet("QLabel { color: #d4d4d4; }")
+        token_layout.addWidget(self.token_label)
+        token_layout.addStretch()
+        
+        send_button = QPushButton("Send")
+        send_button.clicked.connect(self.send_message)
+        send_button.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+        """)
+        input_layout.addWidget(send_button)
+        
+        layout.addLayout(input_layout)
+        layout.addLayout(token_layout)
+        
+        # Add controls
+        controls_layout = QHBoxLayout()
+        
+        # Model selection
+        self.model_combo = QComboBox()
+        self.model_combo.setStyleSheet("QComboBox { background-color: #2d2d2d; color: #d4d4d4; }")
+        controls_layout.addWidget(QLabel("Model:"))
+        controls_layout.addWidget(self.model_combo)
+        
+        # Temperature control
+        controls_layout.addWidget(QLabel("Temperature:"))
+        self.temperature_slider = QSlider(Qt.Horizontal)
+        self.temperature_slider.setRange(0, 100)
+        self.temperature_slider.setValue(70)
+        self.temperature_slider.valueChanged.connect(self.update_temperature)
+        controls_layout.addWidget(self.temperature_slider)
+        
+        # Preset selection
+        controls_layout.addWidget(QLabel("Preset:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(MODEL_PRESETS.keys())
+        self.preset_combo.setCurrentText(self.preset_name)
+        self.preset_combo.currentTextChanged.connect(self.on_preset_changed)
+        controls_layout.addWidget(self.preset_combo)
+        
+        layout.addLayout(controls_layout)
+        
+        # Add status bar
+        self.statusBar().showMessage("Ready")
+        
+        # Add progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.statusBar().addPermanentWidget(self.progress_bar)
+        
     def load_preset(self, preset_name):
         preset = MODEL_PRESETS[preset_name]
         self.temperature = preset["temperature"]
         self.top_p = preset["top_p"]
         self.top_k = preset["top_k"]
         
-    def init_ui(self):
-        self.setWindowTitle("Ollama Chat")
-        self.setMinimumSize(800, 600)
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #1E1E1E;
-                color: #FFFFFF;
-                font-family: 'Segoe UI', sans-serif;
-            }
-            QTextEdit, QLineEdit {
-                background-color: #2D2D2D;
-                color: #FFFFFF;
-                border: 1px solid #3E3E3E;
-                border-radius: 5px;
-                padding: 8px;
-            }
-            QPushButton {
-                background-color: #0078D4;
-                color: white;
-                border: none;
-                border-radius: 5px;
-                padding: 8px 15px;
-                font-weight: bold;
-                min-width: 80px;
-            }
-            QPushButton:hover {
-                background-color: #1084D9;
-            }
-            QComboBox {
-                background-color: #2D2D2D;
-                color: #FFFFFF;
-                border: 1px solid #3E3E3E;
-                border-radius: 5px;
-                padding: 5px;
-            }
-        """)
-
-        # Main layout
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        layout = QVBoxLayout(main_widget)
-        layout.setSpacing(10)
-        layout.setContentsMargins(15, 15, 15, 15)
-
-        # Top bar with status and model selection
-        top_bar = QHBoxLayout()
-        
-        # Status indicator
-        status_layout = QHBoxLayout()
-        self.status_indicator = QLabel()
-        self.status_indicator.setFixedSize(12, 12)
-        status_text = QLabel("Server Status")
-        status_layout.addWidget(self.status_indicator)
-        status_layout.addWidget(status_text)
-        top_bar.addLayout(status_layout)
-        
-        # Model selection
-        model_layout = QHBoxLayout()
-        model_label = QLabel("Model:")
-        self.model_combo = QComboBox()
-        self.model_combo.setFixedWidth(150)
-        model_layout.addWidget(model_label)
-        model_layout.addWidget(self.model_combo)
-        top_bar.addStretch()
-        top_bar.addLayout(model_layout)
-        
-        layout.addLayout(top_bar)
-
-        # Chat display
-        self.chat_display = QTextEdit()
-        self.chat_display.setReadOnly(True)
-        self.chat_display.setMinimumHeight(400)
-        layout.addWidget(self.chat_display)
-
-        # Input area
-        input_layout = QHBoxLayout()
-        self.message_input = QLineEdit()
-        self.message_input.setPlaceholderText("Type your message here...")
-        self.message_input.returnPressed.connect(self.send_message)
-        input_layout.addWidget(self.message_input)
-        
-        self.send_button = QPushButton("Send")
-        self.send_button.clicked.connect(self.send_message)
-        self.send_button.setFixedWidth(100)
-        input_layout.addWidget(self.send_button)
-        
-        layout.addLayout(input_layout)
-
-        # Progress bar
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        self.progress.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #3E3E3E;
-                border-radius: 5px;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background-color: #0078D4;
-                border-radius: 5px;
-            }
-        """)
-        layout.addWidget(self.progress)
-
-        # Status bar
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-        self.statusBar.showMessage("Ready")
-
-        # Add JavaScript for code copying
-        copy_script = """
-            <script>
-            function copyCode(button) {
-                var codeBlock = button.parentElement;
-                var code = codeBlock.querySelector('pre').innerText;
-                navigator.clipboard.writeText(code).then(function() {
-                    button.textContent = 'Copied!';
-                    setTimeout(function() {
-                        button.textContent = 'Copy';
-                    }, 2000);
-                }).catch(function(err) {
-                    console.error('Failed to copy:', err);
-                    button.textContent = 'Error';
-                });
-            }
-            </script>
-        """
-        self.chat_display.document().setHtml(copy_script)
-        self.chat_display.setFont(QFont("Segoe UI", 10))
-        self.chat_display.setMinimumHeight(400)
-        layout.addWidget(self.chat_display)
-
     def setup_shortcuts(self):
         # Send message shortcut (Ctrl+Enter)
         self.send_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
@@ -437,16 +568,17 @@ class ChatWindow(QMainWindow):
         
     def estimate_tokens(self, text):
         # Simple estimation: ~4 characters per token
-        self.estimated_tokens = len(text) // 4
-        self.token_label.setText(f"Estimated Tokens: {self.estimated_tokens} / 4096")
-        return self.estimated_tokens
+        estimated_tokens = len(text) // 4
+        if hasattr(self, 'token_label'):
+            self.token_label.setText(f"Estimated Tokens: {estimated_tokens} / 4096")
+        return estimated_tokens
 
     def set_status(self, message, timeout=3000):
-        self.statusBar.showMessage(message)
+        self.statusBar().showMessage(message)
         self.status_timer.start(timeout)
 
     def clear_status(self):
-        self.statusBar.showMessage("Ready")
+        self.statusBar().showMessage("Ready")
 
     def export_chat(self):
         if not self.chat_history:
@@ -519,138 +651,168 @@ class ChatWindow(QMainWindow):
             self.set_status("Could not load models, using default model")
 
     def update_temperature(self):
-        self.temperature = self.temp_slider.value() / 100
+        self.temperature = self.temperature_slider.value() / 100
         self.temp_value.setText(f"{self.temperature:.2f}")
 
     def send_message(self):
-        message = self.message_input.text().strip()
+        """Send a message to the Ollama server."""
+        if self.worker and self.worker.isRunning():
+            return  # Don't send if already processing
+            
+        message = self.message_input.toPlainText().strip()
         if not message:
             return
 
         # Check token limit
         if self.estimate_tokens(message) > 4096:
-            error_msg = MessageStyle.format_error("Message exceeds token limit")
-            self.chat_display.append(error_msg)
-            self.set_status("Message too long")
+            self.set_status("Message too long! Please reduce the length.")
             return
-
-        # Display user message
-        formatted_message = MessageStyle.format_message("User", message)
-        self.chat_display.append(formatted_message)
-        self.message_input.clear()
+            
+        # Disable input while processing
         self.message_input.setEnabled(False)
-        self.send_button.setEnabled(False)
+        
+        try:
+            # Clear input and add user message to display
+            self.message_input.clear()
+            self.chat_history.append({"role": "user", "content": message})
+            self.update_chat_display()
+            
+            # Show progress bar
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            
+            # Clean up previous worker if it exists
+            if self.worker:
+                self.worker.stop()
+                self.worker.wait()
+                self.worker.deleteLater()
+            
+            # Create and start worker thread
+            self.worker = ChatWorker(
+                self.current_model,
+                message,
+                self.chat_history[:-1],  # Exclude the message we just added
+                self.base_url,
+                self.system_prompt
+            )
+            
+            # Connect signals
+            self.worker.finished.connect(self.on_worker_finished)
+            self.worker.chunk_received.connect(self.handle_chunk)
+            self.worker.response_received.connect(self.handle_response)
+            self.worker.error_occurred.connect(self.handle_error)
+            self.worker.progress_updated.connect(self.progress_bar.setValue)
+            
+            # Start the worker
+            self.worker.start()
+            
+        except Exception as e:
+            self.handle_error(f"Failed to send message: {str(e)}")
+            self.message_input.setEnabled(True)
 
-        # Add user message to history
-        self.chat_history.append({"role": "user", "content": message})
-
-        # Initialize AI response
-        self.chat_display.append(MessageStyle.format_message("Assistant", ""))
-
-        # Create and start worker thread
-        history = []
-        if self.system_input.text().strip():
-            history.append({"role": "system", "content": self.system_input.text().strip()})
-        history.extend(self.chat_history[:-1])  # Exclude the last message as it's added in the worker
-
-        self.worker = ChatWorker(
-            self.current_model,
-            message,
-            history,
-            self.base_url
-        )
-        self.worker.chunk_received.connect(self.handle_chunk)
-        self.worker.response_received.connect(self.handle_response)
-        self.worker.error_occurred.connect(self.handle_error)
-        self.worker.start()
+    def on_worker_finished(self):
+        """Handle worker thread completion."""
+        self.message_input.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        if self.worker:
+            self.worker.deleteLater()
+            self.worker = None
 
     def handle_chunk(self, chunk):
         """Handle incoming message chunks with proper formatting."""
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(cursor.End)
+        if not hasattr(self, 'current_response'):
+            self.current_response = ""
+        self.current_response += chunk
         
-        # If this is a new response, ensure we're on a new line
-        if not cursor.block().text().strip():
-            cursor.insertBlock()
-        
-        # Process the chunk for any code blocks or markdown
-        formatted_chunk = chunk
-        
-        # If chunk contains a complete code block, format it
-        if "```" in chunk:
-            parts = chunk.split("```")
-            formatted_parts = []
-            for i, part in enumerate(parts):
-                if i % 2 == 0:  # Not a code block
-                    formatted_parts.append(MessageStyle.process_markdown(part))
-                else:  # Code block
-                    try:
-                        language = part.split('\n')[0].strip()
-                        code = '\n'.join(part.split('\n')[1:])
-                        formatted_parts.append(MessageStyle.format_code(code, language))
-                    except IndexError:
-                        formatted_parts.append(MessageStyle.format_code(part, ""))
-            formatted_chunk = "".join(formatted_parts)
+        # Update the last message in chat display
+        if self.chat_history and self.chat_history[-1]["role"] == "assistant":
+            self.chat_history[-1]["content"] = self.current_response
         else:
-            # For regular text, just insert it as is
-            formatted_chunk = chunk
+            self.chat_history.append({"role": "assistant", "content": self.current_response})
         
-        cursor.insertHtml(formatted_chunk)
-        self.chat_display.setTextCursor(cursor)
-        self.chat_display.ensureCursorVisible()
-        QApplication.processEvents()
+        self.update_chat_display()
 
     def handle_response(self, response):
-        # Add the complete message to chat history
-        if response.strip():
-            self.chat_history.append({"role": "assistant", "content": response})
-        self.message_input.setEnabled(True)
-        self.send_button.setEnabled(True)
+        """Handle completed response."""
+        self.current_response = ""
+        self.save_chat()  # Auto-save after each response
 
     def handle_error(self, error_message):
-        error_msg = MessageStyle.format_error(f"Error: {error_message}")
-        self.chat_display.append(error_msg)
-        self.message_input.setEnabled(True)
-        self.send_button.setEnabled(True)
+        """Handle error messages with proper formatting."""
+        self.progress_bar.setVisible(False)
+        formatted_error = MessageStyle.format_error(error_message)
+        self.chat_display.append(formatted_error)
+        self.set_status(f"Error: {error_message}")
+
+    def update_chat_display(self):
+        """Update the chat display with all messages."""
+        display_html = []
+        
+        for msg in self.chat_history:
+            formatted_msg = MessageStyle.format_message(msg["role"], msg["content"])
+            display_html.append(formatted_msg)
+        
+        # Add copy-to-clipboard JavaScript
+        js_code = """
+        <script>
+        function copyCode(button) {
+            var pre = button.parentElement.querySelector('pre');
+            var code = pre.innerText;
+            navigator.clipboard.writeText(code).then(function() {
+                button.textContent = 'Copied!';
+                setTimeout(function() { button.textContent = 'Copy'; }, 2000);
+            }).catch(function(err) {
+                console.error('Failed to copy:', err);
+                button.textContent = 'Error';
+            });
+        }
+        </script>
+        """
+        
+        full_html = js_code + "\n".join(display_html)
+        self.chat_display.setHtml(full_html)
+        self.chat_display.verticalScrollBar().setValue(
+            self.chat_display.verticalScrollBar().maximum()
+        )
+
+    def update_server_status(self, status):
+        """Update server status and UI indicators."""
+        self.server_status = status
+        status_color = {
+            ServerStatus.CONNECTED: "#4CAF50",
+            ServerStatus.DISCONNECTED: "#F44336",
+            ServerStatus.CONNECTING: "#FFC107",
+            ServerStatus.ERROR: "#F44336"
+        }.get(status, "#F44336")
+        
+        self.set_status(f"Server Status: {status}")
 
     def clear_chat(self):
-        self.chat_display.clear()
+        """Clear the chat history and display."""
         self.chat_history = []
-
-    def save_chat(self):
-        if not self.chat_history:
-            QMessageBox.information(self, "Info", "No chat history to save.")
-            return
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"chat_log_{timestamp}.json"
-        filepath = os.path.join(self.chat_log_dir, filename)
+        self.chat_display.clear()
+        self.set_status("Chat cleared")
         
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(self.chat_history, f, indent=2)
-            QMessageBox.information(self, "Success", f"Chat saved to: {filepath}")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Could not save chat: {str(e)}")
-
     def load_chat(self):
+        """Load a previous chat session."""
         files = [f for f in os.listdir(self.chat_log_dir) if f.endswith('.json')]
         if not files:
-            QMessageBox.information(self, "Info", "No chat logs found.")
+            self.set_status("No chat logs found")
             return
-
+            
         dialog = QDialog(self)
         dialog.setWindowTitle("Load Chat")
+        dialog.setModal(True)
         layout = QVBoxLayout()
         
         list_widget = QListWidget()
-        list_widget.addItems(files)
+        list_widget.addItems(sorted(files, reverse=True))
         layout.addWidget(list_widget)
         
-        load_button = QPushButton("Load Selected")
-        layout.addWidget(load_button)
-        
-        dialog.setLayout(layout)
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        layout.addWidget(button_box)
         
         def load_selected():
             selected = list_widget.currentItem()
@@ -658,208 +820,86 @@ class ChatWindow(QMainWindow):
                 try:
                     filepath = os.path.join(self.chat_log_dir, selected.text())
                     with open(filepath, 'r', encoding='utf-8') as f:
-                        self.chat_history = json.load(f)
+                        chat_data = json.load(f)
+                        
+                    self.chat_history = chat_data.get('messages', [])
+                    self.current_model = chat_data.get('model', self.current_model)
                     
-                    self.chat_display.clear()
-                    for msg in self.chat_history:
-                        role = "You" if msg["role"] == "user" else "AI"
-                        self.chat_display.append(f"\n{role}: {msg['content']}")
+                    # Update model selection if available
+                    index = self.model_combo.findText(self.current_model)
+                    if index >= 0:
+                        self.model_combo.setCurrentIndex(index)
                     
+                    self.update_chat_display()
+                    self.set_status(f"Loaded chat from {selected.text()}")
                     dialog.accept()
                 except Exception as e:
-                    QMessageBox.warning(self, "Error", f"Could not load chat: {str(e)}")
+                    self.set_status(f"Error loading chat: {str(e)}")
         
-        load_button.clicked.connect(load_selected)
-        dialog.exec_()
-
-    def toggle_theme(self):
-        self.dark_mode = not self.dark_mode
-        self.theme_button.setText("" if self.dark_mode else "")
-        
-        # Update color scheme
-        if self.dark_mode:
-            self.setStyleSheet("""
-                QMainWindow, QWidget { background-color: #1e1e1e; color: #ffffff; }
-                QTextEdit, QLineEdit, QComboBox {
-                    background-color: #2d2d2d;
-                    border: 1px solid #3d3d3d;
-                    border-radius: 4px;
-                    padding: 8px;
-                    color: #ffffff;
-                }
-                QPushButton {
-                    background-color: #0078d4;
-                    color: white;
-                    border: none;
-                }
-                QPushButton:hover { background-color: #106ebe; }
-                QPushButton:pressed { background-color: #005a9e; }
-            """)
-        else:
-            self.setStyleSheet("""
-                QMainWindow, QWidget { background-color: #ffffff; color: #000000; }
-                QTextEdit, QLineEdit, QComboBox {
-                    background-color: #f5f5f5;
-                    border: 1px solid #dddddd;
-                    border-radius: 4px;
-                    padding: 8px;
-                    color: #000000;
-                }
-                QPushButton {
-                    background-color: #0078d4;
-                    color: white;
-                    border: none;
-                }
-                QPushButton:hover { background-color: #106ebe; }
-                QPushButton:pressed { background-color: #005a9e; }
-            """)
-
-    def copy_code_to_clipboard(self, code):
-        clipboard = QApplication.clipboard()
-        clipboard.setText(code)
-        self.set_status("Code copied to clipboard")
-
-    def handle_copy_button_click(self, button):
-        # Find the code block associated with this button
-        code_block = button.parent()
-        if code_block and isinstance(code_block, QTextEdit):
-            code = code_block.toPlainText()
-            self.copy_code_to_clipboard(code)
-
-    def search_chat(self, direction=1):
-        query = self.search_input.text().lower()
-        if not query:
-            return
-            
-        cursor = self.chat_display.textCursor()
-        current_pos = cursor.position()
-        
-        # Get all text
-        text = self.chat_display.toPlainText().lower()
-        
-        if direction > 0:
-            # Search forward
-            next_pos = text.find(query, current_pos)
-            if next_pos == -1:  # Wrap around
-                next_pos = text.find(query)
-        else:
-            # Search backward
-            next_pos = text.rfind(query, 0, current_pos)
-            if next_pos == -1:  # Wrap around
-                next_pos = text.rfind(query)
-                
-        if next_pos != -1:
-            cursor.setPosition(next_pos)
-            cursor.movePosition(cursor.Right, cursor.KeepAnchor, len(query))
-            self.chat_display.setTextCursor(cursor)
-            self.chat_display.ensureCursorVisible()
-        else:
-            self.set_status("Text not found")
-
-    def create_new_branch(self):
-        name, ok = QInputDialog.getText(self, "New Branch", "Enter branch name:")
-        if ok and name:
-            # Save current conversation state
-            branch = {
-                "name": name,
-                "history": self.chat_history.copy(),
-                "system_prompt": self.system_input.text(),
-                "model": self.model_combo.currentText(),
-                "temperature": self.temperature
-            }
-            self.conversation_branches.append(branch)
-            self.current_branch = branch
-            self.branch_label.setText(f"Current Branch: {name}")
-            self.set_status(f"Created new branch: {name}")
-
-    def switch_branch(self):
-        if not self.conversation_branches:
-            self.set_status("No branches available")
-            return
-            
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Switch Branch")
-        layout = QVBoxLayout(dialog)
-        
-        branch_list = QListWidget()
-        branch_list.addItem("Main")
-        for branch in self.conversation_branches:
-            branch_list.addItem(branch["name"])
-            
-        layout.addWidget(branch_list)
-        
-        def switch():
-            selected = branch_list.currentItem()
-            if selected:
-                branch_name = selected.text()
-                if branch_name == "Main":
-                    self.current_branch = None
-                    self.chat_history = []
-                else:
-                    for branch in self.conversation_branches:
-                        if branch["name"] == branch_name:
-                            self.current_branch = branch
-                            self.chat_history = branch["history"].copy()
-                            self.system_input.setText(branch["system_prompt"])
-                            self.model_combo.setCurrentText(branch["model"])
-                            self.temperature = branch["temperature"]
-                            self.temp_slider.setValue(int(self.temperature * 100))
-                            break
-                            
-                self.branch_label.setText(f"Current Branch: {branch_name}")
-                self.update_chat_display()
-                dialog.accept()
-        
-        button_box = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        button_box.accepted.connect(switch)
+        button_box.accepted.connect(load_selected)
         button_box.rejected.connect(dialog.reject)
-        layout.addWidget(button_box)
         
+        dialog.setLayout(layout)
+        dialog.resize(400, 300)
         dialog.exec_()
-
-    def update_chat_display(self):
-        self.chat_display.clear()
-        for msg in self.chat_history:
-            formatted_msg = MessageStyle.format_message(msg["role"], msg["content"])
-            self.chat_display.append(formatted_msg)
-
-    def update_server_status(self, status):
-        """Update server status and UI indicators."""
-        self.server_status = status
-        status_color = {
-            ServerStatus.CONNECTED: "#4CAF50",    # Green
-            ServerStatus.DISCONNECTED: "#F44336", # Red
-            ServerStatus.CONNECTING: "#FFC107",   # Yellow
-            ServerStatus.ERROR: "#F44336"         # Red
-        }.get(status, "#F44336")
         
-        self.status_indicator.setStyleSheet(f"""
-            QLabel {{
-                color: {status_color};
-                padding: 5px;
-                border-radius: 10px;
-                background: qradialgradient(cx:0.5, cy:0.5, radius: 0.5, fx:0.5, fy:0.5,
-                    stop:0 {status_color}, stop:0.5 {status_color}, stop:0.6 transparent);
-            }}
-        """)
-        self.status_indicator.setToolTip(f"Server Status: {status}")
+    def save_chat(self):
+        """Save current chat history to a file."""
+        if not self.chat_history:
+            return
+            
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"chat_{timestamp}.json"
+        filepath = os.path.join(self.chat_log_dir, filename)
         
-        # Update UI elements based on status
-        is_connected = status == ServerStatus.CONNECTED
-        self.message_input.setEnabled(is_connected)
-        self.send_button.setEnabled(is_connected)
-        self.model_combo.setEnabled(is_connected)
+        chat_data = {
+            "model": self.current_model,
+            "timestamp": timestamp,
+            "messages": self.chat_history
+        }
         
-        if not is_connected:
-            self.set_status(f"Server {status}")
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(chat_data, f, indent=2, ensure_ascii=False)
+            self.set_status(f"Chat saved to {filename}")
+        except Exception as e:
+            self.set_status(f"Error saving chat: {str(e)}")
 
 def main():
     app = QApplication(sys.argv)
+    
+    # Set application-wide style
+    app.setStyle('Fusion')
+    
+    # Create dark palette
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(53, 53, 53))
+    palette.setColor(QPalette.WindowText, QColor(255, 255, 255))
+    palette.setColor(QPalette.Base, QColor(25, 25, 25))
+    palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+    palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
+    palette.setColor(QPalette.ToolTipText, QColor(255, 255, 255))
+    palette.setColor(QPalette.Text, QColor(255, 255, 255))
+    palette.setColor(QPalette.Button, QColor(53, 53, 53))
+    palette.setColor(QPalette.ButtonText, QColor(255, 255, 255))
+    palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+    palette.setColor(QPalette.Link, QColor(42, 130, 218))
+    palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+    palette.setColor(QPalette.HighlightedText, QColor(0, 0, 0))
+    
+    # Apply the palette
+    app.setPalette(palette)
+    
+    # Create and show the main window
     window = ChatWindow()
     window.show()
-    sys.exit(app.exec_())
+    
+    # Start the event loop
+    return app.exec_()
 
 if __name__ == '__main__':
-    main()
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"Application error: {str(e)}")
+        sys.exit(1)
