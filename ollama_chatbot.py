@@ -74,7 +74,7 @@ class ServerStatus:
 class MessageStyle:
     USER_COLOR = "#2ecc71"  # Green
     AI_COLOR = "#3498db"    # Blue
-    CODE_BG = "#2d2d2d"     # Dark gray
+    CODE_BG = "#1e1e1e"     # Darker background for code
     ERROR_COLOR = "#e74c3c" # Red
     
     @staticmethod
@@ -82,21 +82,62 @@ class MessageStyle:
         """Format code blocks with syntax highlighting."""
         try:
             lexer = get_lexer_by_name(language)
-            formatter = HtmlFormatter(style='monokai', 
-                                   noclasses=True,
-                                   nobackground=True)
+            formatter = HtmlFormatter(
+                style='monokai',
+                noclasses=True,
+                nobackground=True,
+                linenos=True,
+                cssclass="source",
+                wrapcode=True
+            )
             highlighted = highlight(code, lexer, formatter)
-            return f'<div style="background-color: {MessageStyle.CODE_BG}; padding: 10px; border-radius: 5px; margin: 5px 0;">{highlighted}</div>'
-        except Exception:
-            return f'<pre style="background-color: {MessageStyle.CODE_BG}; padding: 10px; border-radius: 5px; margin: 5px 0;"><code>{code}</code></pre>'
+            
+            # Add custom styling for better readability
+            styled_code = f'''
+            <div style="background-color: {MessageStyle.CODE_BG}; 
+                        padding: 15px; 
+                        border-radius: 8px; 
+                        margin: 10px 0;
+                        font-family: 'Consolas', 'Monaco', monospace;
+                        font-size: 14px;
+                        line-height: 1.4;
+                        overflow-x: auto;
+                        border: 1px solid #2d2d2d;">
+                <div style="color: #f8f8f2;">
+                    {highlighted}
+                </div>
+            </div>
+            '''
+            return styled_code
+        except Exception as e:
+            # Fallback formatting if syntax highlighting fails
+            return f'''
+            <pre style="background-color: {MessageStyle.CODE_BG}; 
+                       color: #f8f8f2;
+                       padding: 15px; 
+                       border-radius: 8px; 
+                       margin: 10px 0;
+                       font-family: 'Consolas', 'Monaco', monospace;
+                       font-size: 14px;
+                       line-height: 1.4;
+                       overflow-x: auto;
+                       border: 1px solid #2d2d2d;">
+                <code>{code}</code>
+            </pre>
+            '''
 
     @staticmethod
     def format_message(text, is_user=True):
         """Format chat messages with proper styling and code highlighting."""
         color = MessageStyle.USER_COLOR if is_user else MessageStyle.AI_COLOR
         
-        # Convert markdown to HTML
-        html = markdown.markdown(text, extensions=['fenced_code', 'codehilite'])
+        # Convert markdown to HTML with proper extensions
+        html = markdown.markdown(text, extensions=[
+            'fenced_code',
+            'codehilite',
+            'tables',
+            'nl2br'
+        ])
         
         # Find and replace code blocks with syntax highlighted versions
         import re
@@ -105,15 +146,21 @@ class MessageStyle:
         def replace_code_block(match):
             code = match.group(1)
             # Unescape HTML entities
-            code = code.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
-            return MessageStyle.format_code_block(code)
+            code = code.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&').replace('&#39;', "'").replace('&quot;', '"')
+            # Try to detect language from opening fence
+            language = 'python'  # default to python
+            return MessageStyle.format_code_block(code, language)
         
         html = re.sub(code_block_pattern, replace_code_block, html, flags=re.DOTALL)
         
-        # Add message styling
+        # Add message styling with improved readability
         styled_html = f'''
-        <div style="color: {color}; margin-bottom: 10px;">
-            <div style="padding: 5px; border-radius: 5px;">
+        <div style="color: {color}; 
+                    margin-bottom: 15px;
+                    font-family: 'Segoe UI', 'Arial', sans-serif;">
+            <div style="padding: 10px;
+                        border-radius: 8px;
+                        line-height: 1.5;">
                 {html}
             </div>
         </div>
@@ -122,12 +169,17 @@ class MessageStyle:
 
     @staticmethod
     def format_error(error_text):
-        """Format error messages."""
+        """Format error messages with improved visibility."""
         return f'''
-        <div style="color: {MessageStyle.ERROR_COLOR}; margin: 5px 0;">
-            <div style="padding: 5px; border-radius: 5px;">
-                Error: {error_text}
-            </div>
+        <div style="color: {MessageStyle.ERROR_COLOR};
+                    margin: 10px 0;
+                    padding: 10px;
+                    background-color: rgba(231, 76, 60, 0.1);
+                    border-left: 4px solid {MessageStyle.ERROR_COLOR};
+                    border-radius: 4px;
+                    font-family: 'Segoe UI', 'Arial', sans-serif;">
+            <div style="font-weight: bold;">Error:</div>
+            <div style="margin-top: 5px;">{error_text}</div>
         </div>
         '''
 
@@ -1097,16 +1149,17 @@ class ChatWindow(QMainWindow):
         self.update_git_status()
 
     def set_git_sync_interval(self):
-        current_interval = self.git_sync.interval // 60  # Convert to minutes
-        interval, ok = QInputDialog.getInt(
-            self, 'Set Sync Interval',
-            'Enter sync interval in minutes:',
+        current_interval = self.git_sync.interval // 3600  # Convert seconds to hours
+        ok, interval = QInputDialog.getInt(
+            self,
+            'Set Git Sync Interval',
+            'Enter sync interval in hours:',
             value=current_interval,
-            min=1, max=60
+            min=1, max=1000
         )
         if ok:
-            self.git_sync.interval = interval * 60  # Convert to seconds
-            self.set_status(f"Git sync interval set to {interval} minutes")
+            self.git_sync.interval = interval * 3600  # Convert hours to seconds
+            self.set_status(f"Git sync interval set to {interval} hours")
 
     def update_git_status(self):
         status = self.git_sync.get_status()
